@@ -6,6 +6,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"reflect"
 	"strings"
 
@@ -14,18 +15,26 @@ import (
 	"github.com/apache/beam/sdks/go/pkg/beam/io/textio"
 	"github.com/apache/beam/sdks/go/pkg/beam/log"
 	"github.com/apache/beam/sdks/go/pkg/beam/options/gcpopts"
-	"github.com/apache/beam/sdks/go/pkg/beam/transforms/stats"
 	"github.com/apache/beam/sdks/go/pkg/beam/x/beamx"
+	"github.com/google/differential-privacy/privacy-on-beam/pbeam"
 )
 
 // CommentRow models 1 row of HackerNews comments.
 type CommentRow struct {
-	Text string `bigquery:"text"`
+	Author string `bigquery:"author"`
+	Text   string `bigquery:"text"`
 }
 
-const query = `SELECT text
+// AuthorNgram represents an ngram and it's author.
+type AuthorNgram struct {
+	Author string
+	Ngram  string
+}
+
+const query = `SELECT author, text
 FROM ` + "`bigquery-public-data.hacker_news.comments`" + `
 WHERE time_ts BETWEEN '2013-01-01' AND '2014-01-01'
+AND author IS NOT NULL AND text IS NOT NULL
 LIMIT 1000
 `
 
@@ -59,21 +68,50 @@ func main() {
 		reflect.TypeOf(CommentRow{}), bigqueryio.UseStandardSQL())
 
 	// Extract unigrams, bigrams, and trigrams from each comment.
-	// Builds a PCollection<string> where each string is a single
-	// occurrence of an ngram.
-	ngrams := beam.ParDo(s, func(row CommentRow, emit func(string)) {
+	// Builds a PCollection<AuthorNgram> to keep track of the author
+	// of each Ngram. We need an identifier for a user to use
+	// differential privacy.
+	authorNgrams := beam.ParDo(s, func(row CommentRow, emit func(AuthorNgram)) {
 		for _, gram := range ngram(row.Text, 1, 2, 3) {
-			emit(gram)
+			emit(AuthorNgram{Author: row.Author, Ngram: gram})
 		}
 	}, rows)
 
+	// Configure differential privacy parameters.
+	epsilon := float64(4)   // ε = 4
+	delta := math.Pow10(-4) // Δ = 1e-4.
+	spec := pbeam.NewPrivacySpec(epsilon, delta)
+
+	// Convert PCollection<AuthorNgram> to PrivatePcollection<AuthorNgram>.
+	// This PrivatePCollection tracks the "Author" field in our AuthorNgram struct
+	// as the user id when applying differential privacy.
+	pgrams := pbeam.MakePrivateFromStruct(s, authorNgrams, spec, "Author")
+
+	// Convert a PrivatePCollection<AuthorNgram> to a PrivatePCollection<string>,
+	// where the string represents each ngram. This method discards the
+	// Author item from our struct so we can count it like normal.
+	// Internally, the PrivatePCollection keeps track of this identifier.
+	ngrams := pbeam.ParDo(s, func(row AuthorNgram, emit func(string)) {
+		emit(row.Ngram)
+	}, pgrams)
+
 	// Count the occurrence of each ngram.
 	// Returns a PCollection<{string, count: int}>.
-	counts := stats.Count(s, ngrams)
+	counts := pbeam.Count(s, ngrams, pbeam.CountParams{
+		// MaxPartitionsContributed is the max number of distinct ngrams a user
+		// can contribute to. If a user contributes more than this number of
+		// unique ngrams some will be randomly dropped.
+		MaxPartitionsContributed: 700,
+		// MaxValue is the number of times a user may contribute
+		// to the same ngram. If a user contributes more than this
+		// amount to the same ngram, additional contributions will
+		// be dropped.
+		MaxValue: 2,
+	})
 
 	// Convert each count row into a string suitable for printing.
 	// Returns a PCollection<string>.
-	formatted := beam.ParDo(s, func(gram string, c int) string {
+	formatted := beam.ParDo(s, func(gram string, c int64) string {
 		return fmt.Sprintf("%s,%v", gram, c)
 	}, counts)
 
